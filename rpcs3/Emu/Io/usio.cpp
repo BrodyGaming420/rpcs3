@@ -207,6 +207,9 @@ void usb_device_usio::translate_input_taiko()
 	// Add valueStates to toggle analog levels per player and per hit lane (4 lanes)
 	static bool valueStates[2][4] = {};
 	
+	// Add last pressed state to detect new presses (1 per player x 4 lanes)
+	static bool last_pressed[2][4] = {};
+	
 	// wait_period hardcoded to 3
 	constexpr u32 wait_period = 3;
 	
@@ -288,14 +291,18 @@ void usb_device_usio::translate_input_taiko()
 					case usio_btn::taiko_hit_side_right:
 						if (const auto idx = btn_to_index(btn))
 						{
-							const auto now = std::chrono::steady_clock::now();
-							const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - press_timestamps[player][*idx]).count();
-							
-							if (pressed && elapsed >= wait_period)
+							if (pressed && !last_pressed[player][*idx])
 							{
-								fire_hit(input_buf.data() + 32 + offset + (*idx) * 2, player, *idx);
-								press_timestamps[player][*idx] = now;
+								const auto now = std::chrono::steady_clock::now();
+								const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - press_timestamps[player][*idx]).count();
+								
+								if (elapsed >= wait_period)
+								{
+									fire_hit(input_buf.data() + 32 + offset + (*idx) * 2, player, *idx);
+									press_timestamps[player][*idx] = now;
+								}
 							}
+							last_pressed[player][*idx] = pressed;
 						}
 						break;
 					default:
@@ -309,6 +316,7 @@ void usb_device_usio::translate_input_taiko()
 			{
 				std::memset(input_buf.data() + 32 + offset + i * 2, 0, sizeof(u16));
 				valueStates[player][i] = false;
+				last_pressed[player][i] = false;
 			}
 			state = {}; // Clear state
 		}
