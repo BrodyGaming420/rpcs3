@@ -204,14 +204,9 @@ void usb_device_usio::translate_input_taiko()
 	std::vector<u8> input_buf(0x60);
 	le_t<u16> digital_input = 0;
 
-	static constexpr u32 COOLDOWN_MS = 30;
-	static constexpr u32 ANALOG_HIT_DURATION_MS = 40;
-
-	static bool valueStates[2][4] = {};
+	// Toggle analog levels per player and lane
+	static bool toggle_state[2][4] = {};
 	static bool last_pressed[2][4] = {};
-	static u32 cooldown_timer[2][4] = {};       // Cooldown between hits
-	static bool queued_hit[2][4] = {};          // Hit queued during cooldown
-	static u32 active_hit_timer[2][4] = {};     // How long analog value stays on
 
 	const auto btn_to_index = [](usio_btn btn) -> std::optional<int>
 	{
@@ -227,16 +222,15 @@ void usb_device_usio::translate_input_taiko()
 
 	const auto fire_hit = [&](u8* ptr, usz player, int lane_index)
 	{
-		bool& lane_state = valueStates[player][lane_index];
-		u16 hitValue = lane_state ? 51 : 50;
-		lane_state = !lane_state;
+		// Alternate between 51 and 50 on every new press
+		bool& toggle = toggle_state[player][lane_index];
+		u16 hit_value = toggle ? 51 : 50;
+		toggle = !toggle;
 
-		u16 analogValue = (hitValue << 15) / 100 + 1;
-		le_t<u16> output = analogValue;
+		// Convert to analog output (16-bit) as expected
+		u16 analog_value = (hit_value << 15) / 100 + 1;
+		le_t<u16> output = analog_value;
 		std::memcpy(ptr, &output, sizeof(u16));
-
-		active_hit_timer[player][lane_index] = ANALOG_HIT_DURATION_MS;
-		cooldown_timer[player][lane_index] = COOLDOWN_MS;
 	};
 
 	const auto clear_hit = [&](u8* ptr)
@@ -263,34 +257,34 @@ void usb_device_usio::translate_input_taiko()
 						if (pressed && !status.test_key_pressed)
 							status.test_on = !status.test_on;
 						status.test_key_pressed = pressed;
-					break;
+						break;
 
 					case usio_btn::coin:
 						if (player != 0) break;
 						if (pressed && !status.coin_key_pressed)
 							status.coin_counter++;
 						status.coin_key_pressed = pressed;
-					break;
+						break;
 
 					case usio_btn::service:
 						if (player == 0 && pressed)
 							digital_input |= 0x4000;
-					break;
+						break;
 
 					case usio_btn::enter:
 						if (player == 0 && pressed)
 							digital_input |= 0x200;
-					break;
+						break;
 
 					case usio_btn::up:
 						if (player == 0 && pressed)
 							digital_input |= 0x2000;
-					break;
+						break;
 
 					case usio_btn::down:
 						if (player == 0 && pressed)
 							digital_input |= 0x1000;
-					break;
+						break;
 
 					case usio_btn::taiko_hit_side_left:
 					case usio_btn::taiko_hit_center_left:
@@ -298,25 +292,22 @@ void usb_device_usio::translate_input_taiko()
 					case usio_btn::taiko_hit_side_right:
 						if (const auto idx = btn_to_index(btn))
 						{
-							const int i = *idx;
-							u8* hit_ptr = input_buf.data() + 32 + offset + i * 2;
+							u8* hit_ptr = input_buf.data() + 32 + offset + (*idx) * 2;
 
-							// Only consider edge and queue
-							if (pressed && !last_pressed[player][i])
+							// Fire analog value only if this is a new press (not held)
+							if (pressed && !last_pressed[player][*idx])
 							{
-								if (cooldown_timer[player][i] == 0)
-								{
-									fire_hit(hit_ptr, player, i);
-								}
-								else
-								{
-									queued_hit[player][i] = true;
-								}
+								fire_hit(hit_ptr, player, *idx);
+							}
+							else
+							{
+								clear_hit(hit_ptr);
 							}
 
-							last_pressed[player][i] = pressed;
+							// Update state
+							last_pressed[player][*idx] = pressed;
 						}
-					break;
+						break;
 
 					default:
 						break;
@@ -325,51 +316,29 @@ void usb_device_usio::translate_input_taiko()
 		}
 		else
 		{
+			// Controller not connected — clear everything
 			for (int i = 0; i < 4; ++i)
 			{
 				std::memset(input_buf.data() + 32 + offset + i * 2, 0, sizeof(u16));
-				valueStates[player][i] = false;
+				toggle_state[player][i] = false;
 				last_pressed[player][i] = false;
-				cooldown_timer[player][i] = 0;
-				queued_hit[player][i] = false;
-				active_hit_timer[player][i] = 0;
 			}
 			state = {};
-		}
-
-		// Process timers and fire queued inputs
-		for (int i = 0; i < 4; ++i)
-		{
-			u8* hit_ptr = input_buf.data() + 32 + offset + i * 2;
-
-			if (cooldown_timer[player][i] > 0)
-				cooldown_timer[player][i]--;
-
-			if (active_hit_timer[player][i] > 0)
-			{
-				active_hit_timer[player][i]--;
-				if (active_hit_timer[player][i] == 0)
-					clear_hit(hit_ptr);
-			}
-
-			// If cooldown expired and something was queued, fire it now
-			if (cooldown_timer[player][i] == 0 && queued_hit[player][i])
-			{
-				fire_hit(hit_ptr, player, i);
-				queued_hit[player][i] = false;
-			}
 		}
 
 		if (player == 0 && status.test_on)
 			digital_input |= 0x80;
 	};
 
+	// Handle P1 and P2
 	for (usz i = 0; i < g_cfg_usio.players.size(); i++)
 		translate_from_pad(i, i);
 
+	// Write digital and coin data
 	std::memcpy(input_buf.data(), &digital_input, sizeof(u16));
 	std::memcpy(input_buf.data() + 16, &m_io_status[0].coin_counter, sizeof(u16));
 
+	// Output to USIO
 	response = std::move(input_buf);
 }
 
