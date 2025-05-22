@@ -5,6 +5,7 @@
 #include "Input/pad_thread.h"
 #include "Emu/Io/usio_config.h"
 #include "Emu/IdManager.h"
+#include <queue>
 
 LOG_CHANNEL(usio_log, "USIO");
 
