@@ -204,46 +204,14 @@ void usb_device_usio::translate_input_taiko()
 	std::vector<u8> input_buf(0x60);
 	le_t<u16> digital_input = 0;
 
-	// Toggle analog levels per player and lane
-	static bool toggle_state[2][4] = {};
-	static bool last_pressed[2][4] = {};
-
-	const auto btn_to_index = [](usio_btn btn) -> std::optional<int>
-	{
-		switch (btn)
-		{
-			case usio_btn::taiko_hit_side_left:   return 0;
-			case usio_btn::taiko_hit_center_left: return 1;
-			case usio_btn::taiko_hit_center_right:return 2;
-			case usio_btn::taiko_hit_side_right:  return 3;
-			default: return std::nullopt;
-		}
-	};
-
-	const auto fire_hit = [&](u8* ptr, usz player, int lane_index)
-	{
-		// Alternate between 51 and 50 on every new press
-		bool& toggle = toggle_state[player][lane_index];
-		u16 hit_value = toggle ? 51 : 50;
-		toggle = !toggle;
-
-		// Convert to analog output (16-bit) as expected
-		u16 analog_value = (hit_value << 15) / 100 + 1;
-		le_t<u16> output = analog_value;
-		std::memcpy(ptr, &output, sizeof(u16));
-	};
-
-	const auto clear_hit = [&](u8* ptr)
-	{
-		le_t<u16> output = 0;
-		std::memcpy(ptr, &output, sizeof(u16));
-	};
-
 	const auto translate_from_pad = [&](usz pad_number, usz player)
 	{
 		const usz offset = player * 8ULL;
 		auto& status = m_io_status[0];
-		auto& state = m_taiko_input_state[player];
+
+		// Track new hits for cooldown
+		static std::unordered_map<usio_btn, bool> was_pressed;
+		static std::unordered_map<usio_btn, u8> toggle_value;
 
 		if (const auto& pad = ::at32(handler->GetPads(), pad_number); (pad->m_port_status & CELL_PAD_STATUS_CONNECTED) && is_input_allowed())
 		{
@@ -252,93 +220,88 @@ void usb_device_usio::translate_input_taiko()
 			{
 				switch (btn)
 				{
-					case usio_btn::test:
-						if (player != 0) break;
-						if (pressed && !status.test_key_pressed)
-							status.test_on = !status.test_on;
-						status.test_key_pressed = pressed;
-						break;
+				case usio_btn::test:
+					if (player != 0) break;
+					if (pressed && !status.test_key_pressed)
+						status.test_on = !status.test_on;
+					status.test_key_pressed = pressed;
+					break;
 
-					case usio_btn::coin:
-						if (player != 0) break;
-						if (pressed && !status.coin_key_pressed)
-							status.coin_counter++;
-						status.coin_key_pressed = pressed;
-						break;
+				case usio_btn::coin:
+					if (player != 0) break;
+					if (pressed && !status.coin_key_pressed)
+						status.coin_counter++;
+					status.coin_key_pressed = pressed;
+					break;
 
-					case usio_btn::service:
-						if (player == 0 && pressed)
-							digital_input |= 0x4000;
-						break;
+				case usio_btn::service:
+					if (player == 0 && pressed)
+						digital_input |= 0x4000;
+					break;
 
-					case usio_btn::enter:
-						if (player == 0 && pressed)
-							digital_input |= 0x200;
-						break;
+				case usio_btn::enter:
+					if (player == 0 && pressed)
+						digital_input |= 0x200;
+					break;
 
-					case usio_btn::up:
-						if (player == 0 && pressed)
-							digital_input |= 0x2000;
-						break;
+				case usio_btn::up:
+					if (player == 0 && pressed)
+						digital_input |= 0x2000;
+					break;
 
-					case usio_btn::down:
-						if (player == 0 && pressed)
-							digital_input |= 0x1000;
-						break;
+				case usio_btn::down:
+					if (player == 0 && pressed)
+						digital_input |= 0x1000;
+					break;
 
-					case usio_btn::taiko_hit_side_left:
-					case usio_btn::taiko_hit_center_left:
-					case usio_btn::taiko_hit_center_right:
-					case usio_btn::taiko_hit_side_right:
-						if (const auto idx = btn_to_index(btn))
+				// Handle Taiko inputs with debounce and alternating values
+				case usio_btn::taiko_hit_side_left:
+				case usio_btn::taiko_hit_center_left:
+				case usio_btn::taiko_hit_center_right:
+				case usio_btn::taiko_hit_side_right:
+				{
+					u8& alt = toggle_value[btn];
+					bool& prev = was_pressed[btn];
+
+					if (pressed && !prev)
+					{
+						// Alternate between 51 and 50
+						const u8 val = 50 + (alt++ % 2);
+						const le_t<u16> analog_hit = (val << 8) | 0x00;
+
+						usz target_offset = 0;
+						switch (btn)
 						{
-							u8* hit_ptr = input_buf.data() + 32 + offset + (*idx) * 2;
-
-							// Fire analog value only if this is a new press (not held)
-							if (pressed && !last_pressed[player][*idx])
-							{
-								fire_hit(hit_ptr, player, *idx);
-							}
-							else
-							{
-								clear_hit(hit_ptr);
-							}
-
-							// Update state
-							last_pressed[player][*idx] = pressed;
+						case usio_btn::taiko_hit_side_left:    target_offset = 32 + offset; break;
+						case usio_btn::taiko_hit_center_left:  target_offset = 34 + offset; break;
+						case usio_btn::taiko_hit_center_right: target_offset = 36 + offset; break;
+						case usio_btn::taiko_hit_side_right:   target_offset = 38 + offset; break;
+						default: break;
 						}
-						break;
 
-					default:
-						break;
+						std::memcpy(input_buf.data() + target_offset, &analog_hit, sizeof(u16));
+					}
+
+					prev = pressed;
+					break;
+				}
+
+				default:
+					break;
 				}
 			});
-		}
-		else
-		{
-			// Controller not connected — clear everything
-			for (int i = 0; i < 4; ++i)
-			{
-				std::memset(input_buf.data() + 32 + offset + i * 2, 0, sizeof(u16));
-				toggle_state[player][i] = false;
-				last_pressed[player][i] = false;
-			}
-			state = {};
 		}
 
 		if (player == 0 && status.test_on)
 			digital_input |= 0x80;
 	};
 
-	// Handle P1 and P2
 	for (usz i = 0; i < g_cfg_usio.players.size(); i++)
 		translate_from_pad(i, i);
 
-	// Write digital and coin data
 	std::memcpy(input_buf.data(), &digital_input, sizeof(u16));
 	std::memcpy(input_buf.data() + 16, &m_io_status[0].coin_counter, sizeof(u16));
 
-	// Output to USIO
 	response = std::move(input_buf);
 }
 
