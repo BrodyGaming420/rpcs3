@@ -198,10 +198,15 @@ void usb_device_usio::save_backup()
 
 void usb_device_usio::translate_input_taiko()
 {
+	static std::unordered_map<usio_btn, bool> toggle_state;
+	static std::unordered_map<usio_btn, bool> held_state;
+
 	std::lock_guard lock(pad::g_pad_mutex);
 	const auto handler = pad::get_pad_thread();
 
 	std::vector<u8> input_buf(0x60);
+	constexpr u16 val_low = 0x0032; // 50
+	constexpr u16 val_high = 0x0033; // 51
 	le_t<u16> digital_input = 0;
 
 	const auto translate_from_pad = [&](usz pad_number, usz player)
@@ -209,15 +214,19 @@ void usb_device_usio::translate_input_taiko()
 		const usz offset = player * 8ULL;
 		auto& status = m_io_status[0];
 
-		// Track new hits for cooldown
-		static std::unordered_map<usio_btn, bool> was_pressed;
-		static std::unordered_map<usio_btn, u8> toggle_value;
-
 		if (const auto& pad = ::at32(handler->GetPads(), pad_number); (pad->m_port_status & CELL_PAD_STATUS_CONNECTED) && is_input_allowed())
 		{
 			const auto& cfg = ::at32(g_cfg_usio.players, pad_number);
 			cfg->handle_input(pad, false, [&](usio_btn btn, pad_button /*pad_btn*/, u16 /*value*/, bool pressed, bool& /*abort*/)
 			{
+				const auto set_hit = [&](usz buf_offset)
+				{
+					bool& toggle = toggle_state[btn];
+					const u16 val = toggle ? val_high : val_low;
+					std::memcpy(input_buf.data() + buf_offset, &val, sizeof(u16));
+					toggle = !toggle;
+				};
+
 				switch (btn)
 				{
 				case usio_btn::test:
@@ -226,66 +235,72 @@ void usb_device_usio::translate_input_taiko()
 						status.test_on = !status.test_on;
 					status.test_key_pressed = pressed;
 					break;
-
 				case usio_btn::coin:
 					if (player != 0) break;
 					if (pressed && !status.coin_key_pressed)
 						status.coin_counter++;
 					status.coin_key_pressed = pressed;
 					break;
-
 				case usio_btn::service:
 					if (player == 0 && pressed)
 						digital_input |= 0x4000;
 					break;
-
 				case usio_btn::enter:
 					if (player == 0 && pressed)
 						digital_input |= 0x200;
 					break;
-
 				case usio_btn::up:
 					if (player == 0 && pressed)
 						digital_input |= 0x2000;
 					break;
-
 				case usio_btn::down:
 					if (player == 0 && pressed)
 						digital_input |= 0x1000;
 					break;
-
-				// Handle Taiko inputs with debounce and alternating values
 				case usio_btn::taiko_hit_side_left:
-				case usio_btn::taiko_hit_center_left:
-				case usio_btn::taiko_hit_center_right:
-				case usio_btn::taiko_hit_side_right:
-				{
-					u8& alt = toggle_value[btn];
-					bool& prev = was_pressed[btn];
-
-					if (pressed && !prev)
+					if (pressed && !held_state[btn])
 					{
-						// Alternate between 51 and 50
-						const u8 val = 50 + (alt++ % 2);
-						const le_t<u16> analog_hit = (val << 8) | 0x00;
-
-						usz target_offset = 0;
-						switch (btn)
-						{
-						case usio_btn::taiko_hit_side_left:    target_offset = 32 + offset; break;
-						case usio_btn::taiko_hit_center_left:  target_offset = 34 + offset; break;
-						case usio_btn::taiko_hit_center_right: target_offset = 36 + offset; break;
-						case usio_btn::taiko_hit_side_right:   target_offset = 38 + offset; break;
-						default: break;
-						}
-
-						std::memcpy(input_buf.data() + target_offset, &analog_hit, sizeof(u16));
+						set_hit(32 + offset);
+						held_state[btn] = true;
 					}
-
-					prev = pressed;
+					else if (!pressed)
+					{
+						held_state[btn] = false;
+					}
 					break;
-				}
-
+				case usio_btn::taiko_hit_center_left:
+					if (pressed && !held_state[btn])
+					{
+						set_hit(34 + offset);
+						held_state[btn] = true;
+					}
+					else if (!pressed)
+					{
+						held_state[btn] = false;
+					}
+					break;
+				case usio_btn::taiko_hit_center_right:
+					if (pressed && !held_state[btn])
+					{
+						set_hit(36 + offset);
+						held_state[btn] = true;
+					}
+					else if (!pressed)
+					{
+						held_state[btn] = false;
+					}
+					break;
+				case usio_btn::taiko_hit_side_right:
+					if (pressed && !held_state[btn])
+					{
+						set_hit(38 + offset);
+						held_state[btn] = true;
+					}
+					else if (!pressed)
+					{
+						held_state[btn] = false;
+					}
+					break;
 				default:
 					break;
 				}
