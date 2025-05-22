@@ -204,13 +204,15 @@ void usb_device_usio::translate_input_taiko()
 	std::vector<u8> input_buf(0x60);
 	le_t<u16> digital_input = 0;
 
-	// Add valueStates to toggle analog levels per player and per hit lane (4 lanes)
+	static constexpr u32 COOLDOWN_MS = 30;
+	static constexpr u32 ANALOG_HIT_DURATION_MS = 40;
+
 	static bool valueStates[2][4] = {};
-
-	// Track press state to detect new presses only
 	static bool last_pressed[2][4] = {};
+	static u32 cooldown_timer[2][4] = {};       // Cooldown between hits
+	static bool queued_hit[2][4] = {};          // Hit queued during cooldown
+	static u32 active_hit_timer[2][4] = {};     // How long analog value stays on
 
-	// Map button to lane index
 	const auto btn_to_index = [](usio_btn btn) -> std::optional<int>
 	{
 		switch (btn)
@@ -225,17 +227,16 @@ void usb_device_usio::translate_input_taiko()
 
 	const auto fire_hit = [&](u8* ptr, usz player, int lane_index)
 	{
-		// Toggle state for lane
 		bool& lane_state = valueStates[player][lane_index];
 		u16 hitValue = lane_state ? 51 : 50;
 		lane_state = !lane_state;
 
-		// Convert to analog output
 		u16 analogValue = (hitValue << 15) / 100 + 1;
-
-		// Write to buffer (as le_t<u16>)
 		le_t<u16> output = analogValue;
 		std::memcpy(ptr, &output, sizeof(u16));
+
+		active_hit_timer[player][lane_index] = ANALOG_HIT_DURATION_MS;
+		cooldown_timer[player][lane_index] = COOLDOWN_MS;
 	};
 
 	const auto clear_hit = [&](u8* ptr)
@@ -262,34 +263,34 @@ void usb_device_usio::translate_input_taiko()
 						if (pressed && !status.test_key_pressed)
 							status.test_on = !status.test_on;
 						status.test_key_pressed = pressed;
-						break;
+					break;
 
 					case usio_btn::coin:
 						if (player != 0) break;
 						if (pressed && !status.coin_key_pressed)
 							status.coin_counter++;
 						status.coin_key_pressed = pressed;
-						break;
+					break;
 
 					case usio_btn::service:
 						if (player == 0 && pressed)
 							digital_input |= 0x4000;
-						break;
+					break;
 
 					case usio_btn::enter:
 						if (player == 0 && pressed)
 							digital_input |= 0x200;
-						break;
+					break;
 
 					case usio_btn::up:
 						if (player == 0 && pressed)
 							digital_input |= 0x2000;
-						break;
+					break;
 
 					case usio_btn::down:
 						if (player == 0 && pressed)
 							digital_input |= 0x1000;
-						break;
+					break;
 
 					case usio_btn::taiko_hit_side_left:
 					case usio_btn::taiko_hit_center_left:
@@ -297,22 +298,25 @@ void usb_device_usio::translate_input_taiko()
 					case usio_btn::taiko_hit_side_right:
 						if (const auto idx = btn_to_index(btn))
 						{
-							u8* hit_ptr = input_buf.data() + 32 + offset + (*idx) * 2;
+							const int i = *idx;
+							u8* hit_ptr = input_buf.data() + 32 + offset + i * 2;
 
-							if (pressed && !last_pressed[player][*idx])
+							// Only consider edge and queue
+							if (pressed && !last_pressed[player][i])
 							{
-								// Edge trigger: fire only on initial press
-								fire_hit(hit_ptr, player, *idx);
-							}
-							else
-							{
-								// Clear when held or released
-								clear_hit(hit_ptr);
+								if (cooldown_timer[player][i] == 0)
+								{
+									fire_hit(hit_ptr, player, i);
+								}
+								else
+								{
+									queued_hit[player][i] = true;
+								}
 							}
 
-							last_pressed[player][*idx] = pressed;
+							last_pressed[player][i] = pressed;
 						}
-						break;
+					break;
 
 					default:
 						break;
@@ -326,8 +330,34 @@ void usb_device_usio::translate_input_taiko()
 				std::memset(input_buf.data() + 32 + offset + i * 2, 0, sizeof(u16));
 				valueStates[player][i] = false;
 				last_pressed[player][i] = false;
+				cooldown_timer[player][i] = 0;
+				queued_hit[player][i] = false;
+				active_hit_timer[player][i] = 0;
 			}
-			state = {}; // Clear state
+			state = {};
+		}
+
+		// Process timers and fire queued inputs
+		for (int i = 0; i < 4; ++i)
+		{
+			u8* hit_ptr = input_buf.data() + 32 + offset + i * 2;
+
+			if (cooldown_timer[player][i] > 0)
+				cooldown_timer[player][i]--;
+
+			if (active_hit_timer[player][i] > 0)
+			{
+				active_hit_timer[player][i]--;
+				if (active_hit_timer[player][i] == 0)
+					clear_hit(hit_ptr);
+			}
+
+			// If cooldown expired and something was queued, fire it now
+			if (cooldown_timer[player][i] == 0 && queued_hit[player][i])
+			{
+				fire_hit(hit_ptr, player, i);
+				queued_hit[player][i] = false;
+			}
 		}
 
 		if (player == 0 && status.test_on)
