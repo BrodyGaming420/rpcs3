@@ -213,6 +213,9 @@ void usb_device_usio::translate_input_taiko()
 	// Track whether a button is being held down (for debouncing)
 	static std::array<std::array<bool, 4>, 2> was_pressed{};
 
+	// FIFO input queue per player, per lane
+	static std::array<std::array<std::queue<bool>, 4>, 2> hit_queues;
+
 	// Button cooldown period (in milliseconds)
 	constexpr u32 wait_period = 3;
 
@@ -294,10 +297,9 @@ void usb_device_usio::translate_input_taiko()
 
 							if (pressed)
 							{
-								// Fire only if not held and cooldown passed
 								if (!was_pressed[player][*idx] && elapsed >= wait_period)
 								{
-									fire_hit(input_buf.data() + 32 + offset + (*idx) * 2, player, *idx);
+									hit_queues[player][*idx].push(true); // Enqueue hit
 									press_timestamps[player][*idx] = now;
 									was_pressed[player][*idx] = true;
 								}
@@ -321,8 +323,20 @@ void usb_device_usio::translate_input_taiko()
 				std::memset(input_buf.data() + 32 + offset + i * 2, 0, sizeof(u16));
 				valueStates[player][i] = false;
 				was_pressed[player][i] = false;
+				std::queue<bool>().swap(hit_queues[player][i]); // Clear queue
 			}
 			state = {};
+		}
+
+		// Fire one hit from the queue per lane
+		for (int i = 0; i < 4; ++i)
+		{
+			auto& queue = hit_queues[player][i];
+			if (!queue.empty())
+			{
+				fire_hit(input_buf.data() + 32 + offset + i * 2, player, i);
+				queue.pop();
+			}
 		}
 
 		if (player == 0 && status.test_on)
