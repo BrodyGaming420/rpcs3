@@ -210,7 +210,7 @@ void usb_device_usio::translate_input_taiko()
 	static std::array<std::array<bool, 4>, 2> was_pressed{};
 
 	constexpr u32 debounce_ms = 3;
-	constexpr u32 wait_period_ms = 125; // ~7.5 frames at 60FPS
+	constexpr u32 wait_period_ms = 8;
 
     static std::array<std::array<std::chrono::steady_clock::time_point, 4>, 2> last_fired_time{};
 
