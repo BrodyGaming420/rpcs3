@@ -210,6 +210,9 @@ void usb_device_usio::translate_input_taiko()
 	static std::array<std::array<bool, 4>, 2> was_pressed{};
 
 	constexpr u32 debounce_ms = 3;
+	constexpr u32 wait_period_ms = 125; // ~7.5 frames at 60FPS
+
+    static std::array<std::array<std::chrono::steady_clock::time_point, 4>, 2> last_fired_time{};
 
 	const auto btn_to_index = [](usio_btn btn) -> std::optional<int>
 	{
@@ -327,13 +330,21 @@ void usb_device_usio::translate_input_taiko()
 
 		// Fire any queued hits
 		for (int i = 0; i < 4; ++i)
-		{
-			if (!input_queue[player][i].empty())
-			{
-				fire_hit(input_buf.data() + 32 + offset + i * 2, player, i);
-				input_queue[player][i].pop_front();
-			}
-		}
+        {
+            if (!input_queue[player][i].empty())
+            {
+                const auto now = std::chrono::steady_clock::now();
+                const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_fired_time[player][i]).count();
+
+                // Allow fire if cooldown expired
+                if (elapsed >= wait_period_ms)
+                {
+                    fire_hit(input_buf.data() + 32 + offset + i * 2, player, i);
+                    last_fired_time[player][i] = now;
+                    input_queue[player][i].pop_front();
+                }
+            }
+        }
 	};
 
 	for (usz i = 0; i < g_cfg_usio.players.size(); i++)
