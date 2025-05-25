@@ -206,11 +206,10 @@ void usb_device_usio::translate_input_taiko()
 	le_t<u16> digital_input = 0;
 
 	static bool valueStates[2][4] = {};
-	static std::array<std::array<std::chrono::steady_clock::time_point, 4>, 2> press_timestamps;
-	static std::array<std::array<bool, 4>, 2> was_pressed{};
 	static std::array<std::array<std::deque<std::chrono::steady_clock::time_point>, 4>, 2> input_queue;
+	static std::array<std::array<bool, 4>, 2> was_pressed{};
 
-	constexpr u32 wait_period = 3;
+	constexpr u32 debounce_ms = 3;
 
 	const auto btn_to_index = [](usio_btn btn) -> std::optional<int>
 	{
@@ -224,31 +223,33 @@ void usb_device_usio::translate_input_taiko()
 		}
 	};
 
-	const auto fire_hit = [&](u8* ptr, usz player, int lane_index)
+	const auto fire_hit = [&](u8* ptr, usz player, int lane)
 	{
 		if (!ptr) return;
 
-		bool& lane_state = valueStates[player][lane_index];
-		u16 hitValue = lane_state ? 51 : 50;
-		lane_state = !lane_state;
+		bool& state = valueStates[player][lane];
+		u16 hit_val = state ? 51 : 50;
+		state = !state;
 
-		u16 analogValue = (hitValue << 15) / 100 + 1;
-		le_t<u16> output = analogValue;
-		std::memcpy(ptr, &output, sizeof(u16));
+		u16 analog_val = (hit_val << 15) / 100 + 1;
+		le_t<u16> out = analog_val;
+		std::memcpy(ptr, &out, sizeof(u16));
 	};
 
-	const auto translate_from_pad = [&](usz pad_number, usz player)
+	const auto translate_from_pad = [&](usz pad_num, usz player)
 	{
-		if (player >= 2 || pad_number >= g_cfg_usio.players.size())
+		if (player >= 2 || pad_num >= g_cfg_usio.players.size())
 			return;
 
 		const usz offset = player * 8ULL;
 		auto& status = m_io_status[0];
 		auto& state = m_taiko_input_state[player];
 
-		if (const auto& pad = ::at32(handler->GetPads(), pad_number); (pad->m_port_status & CELL_PAD_STATUS_CONNECTED) && is_input_allowed())
+		const auto now = std::chrono::steady_clock::now();
+
+		if (const auto& pad = ::at32(handler->GetPads(), pad_num); (pad->m_port_status & CELL_PAD_STATUS_CONNECTED) && is_input_allowed())
 		{
-			const auto& cfg = ::at32(g_cfg_usio.players, pad_number);
+			const auto& cfg = ::at32(g_cfg_usio.players, pad_num);
 			cfg->handle_input(pad, false, [&](usio_btn btn, pad_button, u16, bool pressed, bool&)
 			{
 				if (btn == usio_btn::test && player == 0)
@@ -289,15 +290,16 @@ void usb_device_usio::translate_input_taiko()
 				if (const auto idx = btn_to_index(btn))
 				{
 					const int i = *idx;
-					const auto now = std::chrono::steady_clock::now();
-					const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - press_timestamps[player][i]).count();
 
 					if (pressed)
 					{
-						if (!was_pressed[player][i] && elapsed >= wait_period)
+						if (!was_pressed[player][i])
 						{
-							input_queue[player][i].push_back(now);
-							press_timestamps[player][i] = now;
+							// Queue a hit if debounce threshold met
+							if (input_queue[player][i].empty() || std::chrono::duration_cast<std::chrono::milliseconds>(now - input_queue[player][i].back()).count() >= debounce_ms)
+							{
+								input_queue[player][i].push_back(now);
+							}
 							was_pressed[player][i] = true;
 						}
 					}
@@ -342,7 +344,6 @@ void usb_device_usio::translate_input_taiko()
 
 	response = std::move(input_buf);
 }
-
 
 void usb_device_usio::translate_input_tekken()
 {
