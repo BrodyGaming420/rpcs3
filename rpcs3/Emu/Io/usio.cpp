@@ -152,7 +152,6 @@ void usb_device_usio::control_transfer(u8 bmRequestType, u8 bRequest, u16 wValue
 	}
 }
 
-static bool card_inserted = false;
 extern bool is_input_allowed();
 
 void usb_device_usio::load_backup()
