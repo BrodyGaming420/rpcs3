@@ -6,7 +6,135 @@
 #include "Emu/Io/usio_config.h"
 #include "Emu/IdManager.h"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#endif
+
 LOG_CHANNEL(usio_log, "USIO");
+
+namespace
+{
+constexpr u16 bngrw_bridge_port = 7766;
+
+#ifdef _WIN32
+using bngrw_sock_t = uptr;
+constexpr bngrw_sock_t bngrw_invalid_sock = INVALID_SOCKET;
+inline void bngrw_close_sock(bngrw_sock_t s) { ::closesocket(s); }
+inline int bngrw_sock_errno() { return WSAGetLastError(); }
+inline bool bngrw_would_block(int e) { return e == WSAEWOULDBLOCK; }
+inline void bngrw_set_nonblocking(bngrw_sock_t s) { u_long nb = 1; ::ioctlsocket(s, FIONBIO, &nb); }
+#else
+using bngrw_sock_t = int;
+constexpr bngrw_sock_t bngrw_invalid_sock = -1;
+inline void bngrw_close_sock(bngrw_sock_t s) { ::close(s); }
+inline int bngrw_sock_errno() { return errno; }
+inline bool bngrw_would_block(int e) { return e == EAGAIN || e == EWOULDBLOCK; }
+inline void bngrw_set_nonblocking(bngrw_sock_t s)
+{
+	const int flags = ::fcntl(s, F_GETFL, 0);
+	::fcntl(s, F_SETFL, flags | O_NONBLOCK);
+}
+#endif
+
+std::string bngrw_trim(std::string_view value)
+{
+	while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
+	{
+		value.remove_prefix(1);
+	}
+
+	while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
+	{
+		value.remove_suffix(1);
+	}
+
+	return std::string(value);
+}
+
+std::vector<std::string> bngrw_split(std::string_view line)
+{
+	std::vector<std::string> parts;
+	std::string cur;
+
+	for (char ch : line)
+	{
+		if (std::isspace(static_cast<unsigned char>(ch)))
+		{
+			if (!cur.empty())
+			{
+				parts.push_back(cur);
+				cur.clear();
+			}
+		}
+		else
+		{
+			cur.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+		}
+	}
+
+	if (!cur.empty())
+	{
+		parts.push_back(cur);
+	}
+
+	return parts;
+}
+
+bool bngrw_hex_nibble(char ch, u8& out)
+{
+	if (ch >= '0' && ch <= '9')
+	{
+		out = static_cast<u8>(ch - '0');
+		return true;
+	}
+
+	ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+	if (ch >= 'a' && ch <= 'f')
+	{
+		out = static_cast<u8>(ch - 'a' + 10);
+		return true;
+	}
+
+	return false;
+}
+
+bool bngrw_parse_hex(std::string_view text, std::span<u8> out)
+{
+	std::vector<u8> nibbles;
+	for (char ch : text)
+	{
+		u8 nibble = 0;
+		if (bngrw_hex_nibble(ch, nibble))
+		{
+			nibbles.push_back(nibble);
+		}
+		else if (ch != ':' && ch != '-' && ch != '_' && !std::isspace(static_cast<unsigned char>(ch)))
+		{
+			return false;
+		}
+	}
+
+	if (nibbles.size() != out.size() * 2)
+	{
+		return false;
+	}
+
+	for (usz i = 0; i < out.size(); i++)
+	{
+		out[i] = static_cast<u8>((nibbles[i * 2] << 4) | nibbles[i * 2 + 1]);
+	}
+
+	return true;
+}
+}
 
 template <>
 void fmt_class_string<usio_btn>::format(std::string& out, u64 arg)
@@ -120,10 +248,22 @@ usb_device_usio::usb_device_usio(const std::array<u8, 7>& location)
 			.bInterval        = 16}));
 
 	load_backup();
+	bngrw_bridge_init();
 }
 
 usb_device_usio::~usb_device_usio()
 {
+	if (m_bngrw_client != ~uptr{0})
+	{
+		bngrw_close_sock(static_cast<bngrw_sock_t>(m_bngrw_client));
+		m_bngrw_client = ~uptr{0};
+	}
+	if (m_bngrw_listen != ~uptr{0})
+	{
+		bngrw_close_sock(static_cast<bngrw_sock_t>(m_bngrw_listen));
+		m_bngrw_listen = ~uptr{0};
+	}
+
 	save_backup();
 }
 
@@ -663,10 +803,16 @@ void usb_device_usio::bngrw_cmd_gpio(std::span<const u8> data)
 		if (data[0] == 0x01)
 		{
 			usio_log.notice("BNGRW-USIO LED: 0x%02x", data[1]);
+			bngrw_bridge_send_event(fmt::format("event led 0x%02x", data[1]));
 		}
 		else if (data[0] == 0x08)
 		{
 			usio_log.notice("BNGRW-USIO BEEP: 0x%02x", data[1]);
+			bngrw_bridge_send_event(fmt::format("event beep 0x%02x", data[1]));
+		}
+		else
+		{
+			bngrw_bridge_send_event(fmt::format("event gpio port=0x%02x value=0x%02x", data[0], data[1]));
 		}
 	}
 
@@ -677,14 +823,44 @@ void usb_device_usio::bngrw_cmd_rf_field(std::span<const u8> data)
 {
 	const bool off = data.size() >= 2 && data[0] == 0x01 && data[1] == 0x00;
 	usio_log.notice("BNGRW-USIO RF field: %s", off ? "off" : "on");
+	bngrw_bridge_send_event(off ? "event rf off" : "event rf on");
 	bngrw_send_simple_response();
 }
 
 void usb_device_usio::bngrw_cmd_poll_card()
 {
-	// aic_pico polls real NFC here. RPCS3 dev bridge reports no card until
-	// a host-side card source is wired in.
-	bngrw_send_response(m_bngrw_request[6], {0x00, 0x00, 0x00});
+	bngrw_bridge_poll();
+
+	switch (m_bngrw_card.type)
+	{
+	case bngrw_card_type::mifare:
+	{
+		std::array<u8, 10> card{
+			0x01, 0x01, 0x00, 0x04,
+			0x08, 0x04,
+			m_bngrw_card.uid[0], m_bngrw_card.uid[1], m_bngrw_card.uid[2], m_bngrw_card.uid[3]
+		};
+		bngrw_send_response(m_bngrw_request[6], card);
+		break;
+	}
+	case bngrw_card_type::felica:
+	{
+		std::array<u8, 22> card{
+			0x01, 0x01, 0x14, 0x01,
+			m_bngrw_card.idm[0], m_bngrw_card.idm[1], m_bngrw_card.idm[2], m_bngrw_card.idm[3],
+			m_bngrw_card.idm[4], m_bngrw_card.idm[5], m_bngrw_card.idm[6], m_bngrw_card.idm[7],
+			m_bngrw_card.pmm[0], m_bngrw_card.pmm[1], m_bngrw_card.pmm[2], m_bngrw_card.pmm[3],
+			m_bngrw_card.pmm[4], m_bngrw_card.pmm[5], m_bngrw_card.pmm[6], m_bngrw_card.pmm[7],
+			m_bngrw_card.system_code[0], m_bngrw_card.system_code[1]
+		};
+		bngrw_send_response(m_bngrw_request[6], card);
+		break;
+	}
+	case bngrw_card_type::none:
+	default:
+		bngrw_send_response(m_bngrw_request[6], {0x00, 0x00, 0x00});
+		break;
+	}
 }
 
 void usb_device_usio::bngrw_cmd_mifare(std::span<const u8> data)
@@ -699,9 +875,11 @@ void usb_device_usio::bngrw_cmd_mifare(std::span<const u8> data)
 	{
 	case 0x60:
 	case 0x61:
+		bngrw_bridge_send_event(fmt::format("event mifare auth key=%c block=%u", data[1] == 0x60 ? 'A' : 'B', data.size() >= 3 ? data[2] : 0));
 		bngrw_send_response(m_bngrw_request[6], {0x01});
 		break;
 	case 0x30:
+		bngrw_bridge_send_event(fmt::format("event mifare read block=%u", data.size() >= 3 ? data[2] : 0));
 		bngrw_send_response(m_bngrw_request[6], {0x14});
 		break;
 	default:
@@ -718,22 +896,457 @@ void usb_device_usio::bngrw_cmd_commthru()
 
 void usb_device_usio::bngrw_cmd_select()
 {
+	bngrw_bridge_send_event("event select");
 	bngrw_send_response(m_bngrw_request[6], {0x00});
 }
 
 void usb_device_usio::bngrw_cmd_deselect()
 {
+	bngrw_bridge_send_event("event deselect");
 	bngrw_send_response(m_bngrw_request[6], {0x01, 0x00});
 }
 
 void usb_device_usio::bngrw_cmd_release()
 {
+	bngrw_bridge_send_event("event release");
 	bngrw_send_response(m_bngrw_request[6], {0x01, 0x00});
 }
 
-void usb_device_usio::bngrw_cmd_felica()
+std::array<u8, 16>& usb_device_usio::bngrw_block(u16 block)
 {
-	bngrw_send_response(m_bngrw_request[6], {0x01});
+	auto [it, inserted] = m_bngrw_card.blocks.try_emplace(block);
+	return it->second;
+}
+
+void usb_device_usio::bngrw_felica_read(std::span<const u8> data)
+{
+	// FeliCa Read Without Encryption request body (after 0x06 cmd):
+	// [idm×8] [service_num] [service×(2*N)] [block_num] [block_desc...]
+	if (data.size() < 1 + 8 + 1 + 1)
+	{
+		bngrw_bridge_send_event("event felica_read err short");
+		bngrw_send_response(m_bngrw_request[6], {0x01});
+		return;
+	}
+
+	const u8 service_num = data[8];
+	const usz service_off = 9;
+	const usz block_num_off = service_off + service_num * 2;
+	if (data.size() <= block_num_off)
+	{
+		bngrw_bridge_send_event("event felica_read err truncated");
+		bngrw_send_response(m_bngrw_request[6], {0x01});
+		return;
+	}
+
+	const u8 requested = data[block_num_off];
+	const u8 block_count = std::min<u8>(requested, 4);
+	const u8* descriptors = data.data() + block_num_off + 1;
+	const usz desc_avail = data.size() - (block_num_off + 1);
+
+	std::vector<u8> resp;
+	resp.reserve(2 + 13 + block_count * 16);
+	resp.push_back(0x00); // PN532 status
+	const u8 felica_len = static_cast<u8>(13 + block_count * 16);
+	resp.push_back(felica_len);
+	resp.push_back(0x07); // FeliCa response cmd
+	resp.insert(resp.end(), m_bngrw_card.idm.begin(), m_bngrw_card.idm.end());
+	resp.push_back(0x00); // status flag 1 (OK)
+	resp.push_back(0x00); // status flag 2
+	resp.push_back(block_count);
+
+	usz desc_pos = 0;
+	for (u8 i = 0; i < block_count; i++)
+	{
+		u16 block_id = 0;
+		// 2-byte form (high bit of byte0 set) or 3-byte form. Use simple parse:
+		if (desc_pos + 2 <= desc_avail)
+		{
+			const u8 d0 = descriptors[desc_pos];
+			if (d0 & 0x80)
+			{
+				block_id = descriptors[desc_pos + 1];
+				desc_pos += 2;
+			}
+			else if (desc_pos + 3 <= desc_avail)
+			{
+				block_id = static_cast<u16>(descriptors[desc_pos + 1]) | (static_cast<u16>(descriptors[desc_pos + 2]) << 8);
+				desc_pos += 3;
+			}
+			else
+			{
+				desc_pos = desc_avail;
+			}
+		}
+
+		const auto& blk = bngrw_block(block_id);
+		resp.insert(resp.end(), blk.begin(), blk.end());
+
+		bngrw_bridge_send_event(fmt::format("event felica_read block=0x%04x data=%s",
+			block_id, fmt::buf_to_hexstring(blk.data(), blk.size())));
+	}
+
+	bngrw_send_response(m_bngrw_request[6], resp);
+}
+
+void usb_device_usio::bngrw_felica_write(std::span<const u8> data)
+{
+	// FeliCa Write Without Encryption request body (after 0x08 cmd):
+	// [idm×8] [service_num] [service×(2*N)] [block_num] [block_desc...] [block_data×16*M]
+	if (data.size() < 1 + 8 + 1 + 1)
+	{
+		bngrw_send_response(m_bngrw_request[6], {0x01});
+		return;
+	}
+
+	const u8 service_num = data[8];
+	const usz block_num_off = 9 + service_num * 2;
+	if (data.size() <= block_num_off)
+	{
+		bngrw_send_response(m_bngrw_request[6], {0x01});
+		return;
+	}
+
+	const u8 block_count = data[block_num_off];
+	const u8* descriptors = data.data() + block_num_off + 1;
+	const usz remaining = data.size() - (block_num_off + 1);
+
+	// figure out descriptor bytes consumed (2 or 3 per block); the rest is data
+	std::vector<u16> block_ids;
+	block_ids.reserve(block_count);
+	usz desc_pos = 0;
+	for (u8 i = 0; i < block_count; i++)
+	{
+		if (desc_pos + 2 > remaining)
+		{
+			break;
+		}
+
+		const u8 d0 = descriptors[desc_pos];
+		if (d0 & 0x80)
+		{
+			block_ids.push_back(descriptors[desc_pos + 1]);
+			desc_pos += 2;
+		}
+		else
+		{
+			if (desc_pos + 3 > remaining)
+			{
+				break;
+			}
+			block_ids.push_back(static_cast<u16>(descriptors[desc_pos + 1]) | (static_cast<u16>(descriptors[desc_pos + 2]) << 8));
+			desc_pos += 3;
+		}
+	}
+
+	const u8* blob = descriptors + desc_pos;
+	const usz blob_avail = remaining - desc_pos;
+	for (usz i = 0; i < block_ids.size() && (i + 1) * 16 <= blob_avail; i++)
+	{
+		auto& blk = bngrw_block(block_ids[i]);
+		std::memcpy(blk.data(), blob + i * 16, 16);
+
+		bngrw_bridge_send_event(fmt::format("event felica_write block=0x%04x data=%s",
+			block_ids[i], fmt::buf_to_hexstring(blk.data(), blk.size())));
+	}
+
+	// Response: [status=00][len=12][cmd=0x09][idm×8][flag1=00][flag2=00]
+	std::vector<u8> resp;
+	resp.reserve(2 + 12);
+	resp.push_back(0x00);
+	resp.push_back(0x0c);
+	resp.push_back(0x09);
+	resp.insert(resp.end(), m_bngrw_card.idm.begin(), m_bngrw_card.idm.end());
+	resp.push_back(0x00);
+	resp.push_back(0x00);
+
+	bngrw_send_response(m_bngrw_request[6], resp);
+}
+
+void usb_device_usio::bngrw_cmd_felica(std::span<const u8> data)
+{
+	// PN532 0xa0 payload: [timeout_lo, timeout_hi, felica_len, felica_cmd, ...]
+	if (data.size() < 4)
+	{
+		bngrw_bridge_send_event("event felica err short");
+		bngrw_send_response(m_bngrw_request[6], {0x01});
+		return;
+	}
+
+	const u8 felica_cmd = data[3];
+	const std::span<const u8> body = data.subspan(4);
+
+	switch (felica_cmd)
+	{
+	case 0x06:
+		bngrw_felica_read(body);
+		return;
+	case 0x08:
+		bngrw_felica_write(body);
+		return;
+	default:
+		bngrw_bridge_send_event(fmt::format("event felica unhandled cmd=0x%02x", felica_cmd));
+		bngrw_send_response(m_bngrw_request[6], {0x01});
+		return;
+	}
+}
+
+void usb_device_usio::bngrw_bridge_init()
+{
+	const bngrw_sock_t s = ::socket(AF_INET, SOCK_STREAM, 0);
+	if (s == bngrw_invalid_sock)
+	{
+		usio_log.warning("BNGRW-USIO bridge socket() failed");
+		return;
+	}
+
+	int yes = 1;
+	::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes));
+
+	sockaddr_in addr{};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(bngrw_bridge_port);
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+	if (::bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0)
+	{
+		usio_log.warning("BNGRW-USIO bridge bind() failed on port %u (errno=%d)", bngrw_bridge_port, bngrw_sock_errno());
+		bngrw_close_sock(s);
+		return;
+	}
+
+	if (::listen(s, 1) != 0)
+	{
+		usio_log.warning("BNGRW-USIO bridge listen() failed");
+		bngrw_close_sock(s);
+		return;
+	}
+
+	bngrw_set_nonblocking(s);
+	m_bngrw_listen = static_cast<uptr>(s);
+	usio_log.notice("BNGRW-USIO bridge listening on 127.0.0.1:%u", bngrw_bridge_port);
+}
+
+void usb_device_usio::bngrw_bridge_close_client()
+{
+	if (m_bngrw_client != ~uptr{0})
+	{
+		bngrw_close_sock(static_cast<bngrw_sock_t>(m_bngrw_client));
+		m_bngrw_client = ~uptr{0};
+		m_bngrw_rx_buffer.clear();
+		usio_log.notice("BNGRW-USIO bridge client disconnected");
+	}
+}
+
+void usb_device_usio::bngrw_bridge_send_event(std::string_view line)
+{
+	if (m_bngrw_client == ~uptr{0})
+	{
+		return;
+	}
+
+	std::string buffer;
+	buffer.reserve(line.size() + 1);
+	buffer.append(line);
+	buffer.push_back('\n');
+
+	const bngrw_sock_t c = static_cast<bngrw_sock_t>(m_bngrw_client);
+#ifdef _WIN32
+	const int sent = ::send(c, buffer.data(), static_cast<int>(buffer.size()), 0);
+#else
+	const ssize_t sent = ::send(c, buffer.data(), buffer.size(), MSG_NOSIGNAL);
+#endif
+	if (sent < 0 && !bngrw_would_block(bngrw_sock_errno()))
+	{
+		bngrw_bridge_close_client();
+	}
+}
+
+void usb_device_usio::bngrw_bridge_send_state()
+{
+	switch (m_bngrw_card.type)
+	{
+	case bngrw_card_type::none:
+		bngrw_bridge_send_event("state none");
+		break;
+	case bngrw_card_type::mifare:
+		bngrw_bridge_send_event(fmt::format("state mifare %s",
+			fmt::buf_to_hexstring(m_bngrw_card.uid.data(), m_bngrw_card.uid.size())));
+		break;
+	case bngrw_card_type::felica:
+		bngrw_bridge_send_event(fmt::format("state felica %s %s %s",
+			fmt::buf_to_hexstring(m_bngrw_card.idm.data(), m_bngrw_card.idm.size()),
+			fmt::buf_to_hexstring(m_bngrw_card.pmm.data(), m_bngrw_card.pmm.size()),
+			fmt::buf_to_hexstring(m_bngrw_card.system_code.data(), m_bngrw_card.system_code.size())));
+		break;
+	}
+}
+
+void usb_device_usio::bngrw_bridge_poll()
+{
+	if (m_bngrw_listen == ~uptr{0})
+	{
+		return;
+	}
+
+	if (m_bngrw_client == ~uptr{0})
+	{
+		const bngrw_sock_t accepted = ::accept(static_cast<bngrw_sock_t>(m_bngrw_listen), nullptr, nullptr);
+		if (accepted != bngrw_invalid_sock)
+		{
+			bngrw_set_nonblocking(accepted);
+			m_bngrw_client = static_cast<uptr>(accepted);
+			usio_log.notice("BNGRW-USIO bridge client connected");
+			bngrw_bridge_send_event("event hello");
+			bngrw_bridge_send_state();
+		}
+	}
+
+	if (m_bngrw_client == ~uptr{0})
+	{
+		return;
+	}
+
+	char buf[256];
+	while (true)
+	{
+		const bngrw_sock_t c = static_cast<bngrw_sock_t>(m_bngrw_client);
+#ifdef _WIN32
+		const int n = ::recv(c, buf, static_cast<int>(sizeof(buf)), 0);
+#else
+		const ssize_t n = ::recv(c, buf, sizeof(buf), 0);
+#endif
+		if (n > 0)
+		{
+			m_bngrw_rx_buffer.append(buf, static_cast<usz>(n));
+			continue;
+		}
+
+		if (n == 0)
+		{
+			bngrw_bridge_close_client();
+			return;
+		}
+
+		if (!bngrw_would_block(bngrw_sock_errno()))
+		{
+			bngrw_bridge_close_client();
+			return;
+		}
+
+		break;
+	}
+
+	usz newline = std::string::npos;
+	while ((newline = m_bngrw_rx_buffer.find('\n')) != std::string::npos)
+	{
+		const std::string line = bngrw_trim(std::string_view(m_bngrw_rx_buffer).substr(0, newline));
+		m_bngrw_rx_buffer.erase(0, newline + 1);
+
+		if (line.empty())
+		{
+			continue;
+		}
+
+		const std::vector<std::string> args = bngrw_split(line);
+		if (args.empty())
+		{
+			continue;
+		}
+
+		if (args[0] == "none" || args[0] == "clear" || args[0] == "off" || args[0] == "remove")
+		{
+			m_bngrw_card = {};
+			m_bngrw_pending = {};
+			m_bngrw_pending_active = false;
+			usio_log.notice("BNGRW-USIO card cleared");
+			bngrw_bridge_send_event("ok cleared");
+			bngrw_bridge_send_state();
+		}
+		else if (args[0] == "status" || args[0] == "?")
+		{
+			bngrw_bridge_send_state();
+		}
+		else if (args[0] == "begin" && args.size() >= 3)
+		{
+			m_bngrw_pending = {};
+			m_bngrw_pending_active = true;
+
+			if (args[1] == "mifare" && bngrw_parse_hex(args[2], m_bngrw_pending.uid))
+			{
+				m_bngrw_pending.type = bngrw_card_type::mifare;
+				bngrw_bridge_send_event("ok begin mifare");
+			}
+			else if ((args[1] == "felica" || args[1] == "bana") && bngrw_parse_hex(args[2], m_bngrw_pending.idm))
+			{
+				m_bngrw_pending.type = bngrw_card_type::felica;
+				if (args.size() >= 4)
+				{
+					bngrw_parse_hex(args[3], m_bngrw_pending.pmm);
+				}
+				if (args.size() >= 5)
+				{
+					bngrw_parse_hex(args[4], m_bngrw_pending.system_code);
+				}
+				bngrw_bridge_send_event("ok begin felica");
+			}
+			else
+			{
+				m_bngrw_pending_active = false;
+				bngrw_bridge_send_event("err begin bad_args");
+			}
+		}
+		else if (args[0] == "block" && args.size() >= 3)
+		{
+			if (!m_bngrw_pending_active)
+			{
+				bngrw_bridge_send_event("err block no_pending");
+			}
+			else
+			{
+				std::array<u8, 2> id_bytes{};
+				std::array<u8, 16> blk{};
+				if (!bngrw_parse_hex(args[1], id_bytes) || !bngrw_parse_hex(args[2], blk))
+				{
+					bngrw_bridge_send_event("err block bad_hex");
+				}
+				else
+				{
+					const u16 block_id = static_cast<u16>((id_bytes[0] << 8) | id_bytes[1]);
+					m_bngrw_pending.blocks[block_id] = blk;
+					bngrw_bridge_send_event(fmt::format("ok block 0x%04x", block_id));
+				}
+			}
+		}
+		else if (args[0] == "present" || args[0] == "commit")
+		{
+			if (!m_bngrw_pending_active || m_bngrw_pending.type == bngrw_card_type::none)
+			{
+				bngrw_bridge_send_event("err present no_pending");
+			}
+			else
+			{
+				m_bngrw_card = std::move(m_bngrw_pending);
+				m_bngrw_pending = {};
+				m_bngrw_pending_active = false;
+				usio_log.notice("BNGRW-USIO card presented (type=%u, %zu blocks)",
+					static_cast<u32>(m_bngrw_card.type), m_bngrw_card.blocks.size());
+				bngrw_bridge_send_event("ok present");
+				bngrw_bridge_send_state();
+			}
+		}
+		else if (args[0] == "cancel" || args[0] == "abort")
+		{
+			m_bngrw_pending = {};
+			m_bngrw_pending_active = false;
+			bngrw_bridge_send_event("ok cancel");
+		}
+		else
+		{
+			usio_log.warning("BNGRW-USIO bridge unknown command: %s", line);
+			bngrw_bridge_send_event(fmt::format("err unknown %s", line));
+		}
+	}
 }
 
 // BNGRW command handling is ported from aic_pico firmware/src/lib/bana.c
@@ -808,7 +1421,7 @@ void usb_device_usio::bngrw_handle_frame()
 		bngrw_cmd_deselect();
 		break;
 	case 0xa0:
-		bngrw_cmd_felica();
+		bngrw_cmd_felica(payload);
 		break;
 	case 0x52:
 		bngrw_cmd_release();

@@ -5,6 +5,7 @@
 
 #include <deque>
 #include <initializer_list>
+#include <map>
 #include <span>
 
 class usb_device_usio : public usb_device_emulated
@@ -41,7 +42,15 @@ private:
 	void bngrw_cmd_select();
 	void bngrw_cmd_deselect();
 	void bngrw_cmd_release();
-	void bngrw_cmd_felica();
+	void bngrw_cmd_felica(std::span<const u8> data);
+	void bngrw_felica_read(std::span<const u8> data);
+	void bngrw_felica_write(std::span<const u8> data);
+	std::array<u8, 16>& bngrw_block(u16 block);
+	void bngrw_bridge_init();
+	void bngrw_bridge_poll();
+	void bngrw_bridge_close_client();
+	void bngrw_bridge_send_event(std::string_view line);
+	void bngrw_bridge_send_state();
 
 private:
 	bool is_used = false;
@@ -49,6 +58,30 @@ private:
 	std::vector<u8> response;
 	std::vector<u8> m_bngrw_request;
 	std::deque<u8> m_bngrw_response;
+	uptr m_bngrw_listen = ~uptr{0};
+	uptr m_bngrw_client = ~uptr{0};
+	std::string m_bngrw_rx_buffer;
+
+	enum class bngrw_card_type : u8
+	{
+		none,
+		mifare,
+		felica
+	};
+
+	struct bngrw_card_state
+	{
+		bngrw_card_type type = bngrw_card_type::none;
+		std::array<u8, 4> uid{};
+		std::array<u8, 8> idm{};
+		std::array<u8, 8> pmm{0x00, 0xf1, 0x00, 0x00, 0x00, 0x01, 0x43, 0x00};
+		std::array<u8, 2> system_code{0x88, 0xb4};
+		std::map<u16, std::array<u8, 16>> blocks;
+	};
+
+	bngrw_card_state m_bngrw_card;
+	bngrw_card_state m_bngrw_pending;
+	bool m_bngrw_pending_active = false;
 
 	struct io_status
 	{
