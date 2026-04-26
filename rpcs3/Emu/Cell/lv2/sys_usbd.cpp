@@ -849,7 +849,15 @@ bool usb_handler_thread::get_event(vm::ptr<u64>& arg1, vm::ptr<u64>& arg2, vm::p
 		*arg2                 = std::get<1>(usb_event);
 		*arg3                 = std::get<2>(usb_event);
 		usbd_events.pop();
-		sys_usbd.trace("Received event: arg1=0x%x arg2=0x%x arg3=0x%x", *arg1, *arg2, *arg3);
+
+		if (*arg1 == SYS_USBD_ATTACH || *arg1 == SYS_USBD_DETACH)
+		{
+			sys_usbd.notice("Received event: arg1=0x%x arg2=0x%x arg3=0x%x", *arg1, *arg2, *arg3);
+		}
+		else
+		{
+			sys_usbd.trace("Received event: arg1=0x%x arg2=0x%x arg3=0x%x", *arg1, *arg2, *arg3);
+		}
 		return true;
 	}
 
@@ -863,7 +871,14 @@ void usb_handler_thread::add_event(u64 arg1, u64 arg2, u64 arg3)
 
 	if (const auto cpu = lv2_obj::schedule<ppu_thread>(sq, SYS_SYNC_PRIORITY))
 	{
-		sys_usbd.trace("Sending event(queue): arg1=0x%x arg2=0x%x arg3=0x%x", arg1, arg2, arg3);
+		if (arg1 == SYS_USBD_ATTACH || arg1 == SYS_USBD_DETACH)
+		{
+			sys_usbd.notice("Sending event(queue): arg1=0x%x arg2=0x%x arg3=0x%x", arg1, arg2, arg3);
+		}
+		else
+		{
+			sys_usbd.trace("Sending event(queue): arg1=0x%x arg2=0x%x arg3=0x%x", arg1, arg2, arg3);
+		}
 		cpu->gpr[4] = arg1;
 		cpu->gpr[5] = arg2;
 		cpu->gpr[6] = arg3;
@@ -871,7 +886,14 @@ void usb_handler_thread::add_event(u64 arg1, u64 arg2, u64 arg3)
 	}
 	else
 	{
-		sys_usbd.trace("Sending event: arg1=0x%x arg2=0x%x arg3=0x%x", arg1, arg2, arg3);
+		if (arg1 == SYS_USBD_ATTACH || arg1 == SYS_USBD_DETACH)
+		{
+			sys_usbd.notice("Sending event: arg1=0x%x arg2=0x%x arg3=0x%x", arg1, arg2, arg3);
+		}
+		else
+		{
+			sys_usbd.trace("Sending event: arg1=0x%x arg2=0x%x arg3=0x%x", arg1, arg2, arg3);
+		}
 		usbd_events.emplace(arg1, arg2, arg3);
 	}
 }
@@ -1180,7 +1202,9 @@ error_code sys_usbd_get_device_list(ppu_thread& ppu, u32 handle, vm::ptr<UsbInte
 	{
 		if (index == i_tocopy)
 			break;
-		
+
+		sys_usbd.notice("sys_usbd_get_device_list(): device[%u] handle=0x%x VID=0x%04x PID=0x%04x internal=%02x %02x %02x %02x",
+			index, _, device.second->device._device.idVendor, device.second->device._device.idProduct, device.first.device_high, device.first.device_low, device.first.unk3, device.first.unk4);
 		device_list[index++] = device.first;
 	}
 
@@ -1191,7 +1215,7 @@ error_code sys_usbd_register_extra_ldd(ppu_thread& ppu, u32 handle, vm::cptr<cha
 {
 	ppu.state += cpu_flag::wait;
 
-	sys_usbd.trace("sys_usbd_register_extra_ldd(handle=0x%x, s_product=%s, slen_product=%d, id_vendor=0x%04x, id_product_min=0x%04x, id_product_max=0x%04x)", handle, s_product, slen_product, id_vendor, id_product_min, id_product_max);
+	sys_usbd.notice("sys_usbd_register_extra_ldd(handle=0x%x, s_product=%s, slen_product=%d, id_vendor=0x%04x, id_product_min=0x%04x, id_product_max=0x%04x)", handle, s_product, slen_product, id_vendor, id_product_min, id_product_max);
 
 	auto& usbh = g_fxo->get<named_thread<usb_handler_thread>>();
 
@@ -1231,7 +1255,7 @@ error_code sys_usbd_get_descriptor_size(ppu_thread& ppu, u32 handle, u32 device_
 {
 	ppu.state += cpu_flag::wait;
 
-	sys_usbd.trace("sys_usbd_get_descriptor_size(handle=0x%x, deviceNumber=0x%x)", handle, device_handle);
+	sys_usbd.notice("sys_usbd_get_descriptor_size(handle=0x%x, deviceNumber=0x%x)", handle, device_handle);
 
 	auto& usbh = g_fxo->get<named_thread<usb_handler_thread>>();
 
@@ -1242,14 +1266,18 @@ error_code sys_usbd_get_descriptor_size(ppu_thread& ppu, u32 handle, u32 device_
 		return CELL_EINVAL;
 	}
 
-	return not_an_error(usbh.handled_devices[device_handle].second->device.get_size());
+	const auto& dev = usbh.handled_devices[device_handle].second;
+	const u32 size = dev->device.get_size();
+	sys_usbd.notice("sys_usbd_get_descriptor_size(): deviceNumber=0x%x VID=0x%04x PID=0x%04x size=0x%x",
+		device_handle, dev->device._device.idVendor, dev->device._device.idProduct, size);
+	return not_an_error(size);
 }
 
 error_code sys_usbd_get_descriptor(ppu_thread& ppu, u32 handle, u32 device_handle, vm::ptr<void> descriptor, u32 desc_size)
 {
 	ppu.state += cpu_flag::wait;
 
-	sys_usbd.trace("sys_usbd_get_descriptor(handle=0x%x, deviceNumber=0x%x, descriptor=0x%x, desc_size=0x%x)", handle, device_handle, descriptor, desc_size);
+	sys_usbd.notice("sys_usbd_get_descriptor(handle=0x%x, deviceNumber=0x%x, descriptor=0x%x, desc_size=0x%x)", handle, device_handle, descriptor, desc_size);
 
 	if (!descriptor)
 	{
@@ -1270,7 +1298,10 @@ error_code sys_usbd_get_descriptor(ppu_thread& ppu, u32 handle, u32 device_handl
 		return CELL_ENOMEM;
 	}
 
-	usbh.handled_devices[device_handle].second->device.write_data(reinterpret_cast<u8*>(descriptor.get_ptr()), desc_size);
+	const auto& dev = usbh.handled_devices[device_handle].second;
+	dev->device.write_data(reinterpret_cast<u8*>(descriptor.get_ptr()), desc_size);
+	sys_usbd.notice("sys_usbd_get_descriptor(): deviceNumber=0x%x VID=0x%04x PID=0x%04x descriptor=%s",
+		device_handle, dev->device._device.idVendor, dev->device._device.idProduct, fmt::buf_to_hexstring(reinterpret_cast<const u8*>(descriptor.get_ptr()), desc_size));
 
 	return CELL_OK;
 }
@@ -1294,7 +1325,7 @@ error_code sys_usbd_register_ldd(ppu_thread& ppu, u32 handle, vm::cptr<char> s_p
 
 	if (const auto iterator = predefined_ldds.find(product); iterator != predefined_ldds.end())
 	{
-		sys_usbd.trace("sys_usbd_register_ldd(handle=0x%x, s_product=%s, slen_product=%d) -> Redirecting to sys_usbd_register_extra_ldd()", handle, s_product, slen_product);
+		sys_usbd.notice("sys_usbd_register_ldd(handle=0x%x, s_product=%s, slen_product=%d) -> Redirecting to sys_usbd_register_extra_ldd()", handle, s_product, slen_product);
 		return sys_usbd_register_extra_ldd(ppu, handle, s_product, slen_product, iterator->second.id_vendor, iterator->second.id_product_min, iterator->second.id_product_max);
 	}
 
@@ -1328,14 +1359,16 @@ error_code sys_usbd_open_pipe(ppu_thread& ppu, u32 handle, u32 device_handle, u3
 		return CELL_EINVAL;
 	}
 
-	return not_an_error(usbh.open_pipe(device_handle, static_cast<u8>(endpoint)));
+	const u32 pipe = usbh.open_pipe(device_handle, static_cast<u8>(endpoint));
+	sys_usbd.notice("sys_usbd_open_pipe(): device_handle=0x%x endpoint=0x%x -> pipe=0x%x", device_handle, endpoint, pipe);
+	return not_an_error(pipe);
 }
 
 error_code sys_usbd_open_default_pipe(ppu_thread& ppu, u32 handle, u32 device_handle)
 {
 	ppu.state += cpu_flag::wait;
 
-	sys_usbd.trace("sys_usbd_open_default_pipe(handle=0x%x, device_handle=0x%x)", handle, device_handle);
+	sys_usbd.notice("sys_usbd_open_default_pipe(handle=0x%x, device_handle=0x%x)", handle, device_handle);
 
 	auto& usbh = g_fxo->get<named_thread<usb_handler_thread>>();
 
@@ -1346,7 +1379,9 @@ error_code sys_usbd_open_default_pipe(ppu_thread& ppu, u32 handle, u32 device_ha
 		return CELL_EINVAL;
 	}
 
-	return not_an_error(usbh.open_pipe(device_handle, 0));
+	const u32 pipe = usbh.open_pipe(device_handle, 0);
+	sys_usbd.notice("sys_usbd_open_default_pipe(): device_handle=0x%x -> pipe=0x%x", device_handle, pipe);
+	return not_an_error(pipe);
 }
 
 error_code sys_usbd_close_pipe(ppu_thread& ppu, u32 handle, u32 pipe_handle)
@@ -1407,7 +1442,14 @@ error_code sys_usbd_receive_event(ppu_thread& ppu, u32 handle, vm::ptr<u64> arg1
 	{
 		if (state & cpu_flag::signal && ppu.state.test_and_reset(cpu_flag::signal))
 		{
-			sys_usbd.trace("Received event(queued): arg1=0x%x arg2=0x%x arg3=0x%x", ppu.gpr[4], ppu.gpr[5], ppu.gpr[6]);
+			if (ppu.gpr[4] == SYS_USBD_ATTACH || ppu.gpr[4] == SYS_USBD_DETACH)
+			{
+				sys_usbd.notice("Received event(queued): arg1=0x%x arg2=0x%x arg3=0x%x", ppu.gpr[4], ppu.gpr[5], ppu.gpr[6]);
+			}
+			else
+			{
+				sys_usbd.trace("Received event(queued): arg1=0x%x arg2=0x%x arg3=0x%x", ppu.gpr[4], ppu.gpr[5], ppu.gpr[6]);
+			}
 			break;
 		}
 
@@ -1454,7 +1496,19 @@ error_code sys_usbd_attach(ppu_thread& ppu, u32 handle, u32 unk1, u32 unk2, u32 
 {
 	ppu.state += cpu_flag::wait;
 
-	sys_usbd.todo("sys_usbd_attach(handle=0x%x, unk1=0x%x, unk2=0x%x, device_handle=0x%x)", handle, unk1, unk2, device_handle);
+	auto& usbh = g_fxo->get<named_thread<usb_handler_thread>>();
+
+	std::lock_guard lock(usbh.mutex);
+
+	if (!usbh.is_init || !usbh.handled_devices.count(device_handle))
+	{
+		sys_usbd.error("sys_usbd_attach(handle=0x%x, unk1=0x%x, unk2=0x%x, device_handle=0x%x) -> CELL_EINVAL", handle, unk1, unk2, device_handle);
+		return CELL_EINVAL;
+	}
+
+	const auto& dev = usbh.handled_devices[device_handle].second;
+	sys_usbd.notice("sys_usbd_attach(handle=0x%x, unk1=0x%x, unk2=0x%x, device_handle=0x%x, VID=0x%04x, PID=0x%04x)",
+		handle, unk1, unk2, device_handle, dev->device._device.idVendor, dev->device._device.idProduct);
 	return CELL_OK;
 }
 

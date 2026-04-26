@@ -127,14 +127,19 @@ usb_device_usio::~usb_device_usio()
 	save_backup();
 }
 
-std::shared_ptr<usb_device> usb_device_usio::make_instance(u32, const std::array<u8, 7>& location)
+std::shared_ptr<usb_device> usb_device_usio::make_instance(u32 controller_index, const std::array<u8, 7>& location)
 {
+	if (controller_index == 1)
+	{
+		return std::make_shared<usb_device_bngrw>(location);
+	}
+
 	return std::make_shared<usb_device_usio>(location);
 }
 
 u16 usb_device_usio::get_num_emu_devices()
 {
-	return 1;
+	return 2;
 }
 
 void usb_device_usio::control_transfer(u8 bmRequestType, u8 bRequest, u16 wValue, u16 wIndex, u16 wLength, u32 buf_size, u8* buf, UsbTransfer* transfer)
@@ -461,6 +466,17 @@ void usb_device_usio::usio_write(u8 channel, u16 reg, std::vector<u8>& data)
 			usio_log.trace("SetHopperRequest(Hopper: %d, Limit: 0x%04X)", (reg - 0x4A) / 0x10, get_u16("SetHopperLimit"));
 			break;
 		}
+		case 0x7000:
+		{
+			usio_log.notice("BNGRW-USIO control write: %s", fmt::buf_to_hexstring(data.data(), data.size()));
+			break;
+		}
+		case 0x7400:
+		{
+			usio_log.notice("BNGRW-USIO write: %s", fmt::buf_to_hexstring(data.data(), data.size()));
+			bngrw_feed_bytes(data.data(), ::size32(data));
+			break;
+		}
 		default:
 		{
 			usio_log.trace("Unhandled channel 0 register write(reg: 0x%04X, size: 0x%04X, data: %s)", reg, data.size(), fmt::buf_to_hexstring(data.data(), data.size()));
@@ -503,14 +519,25 @@ void usb_device_usio::usio_read(u8 channel, u16 reg, u16 size)
 		}
 		case 0x0080:
 		{
-			// Card reader check - 1
 			response = {0x02, 0x03, 0x06, 0x00, 0xFF, 0x0F, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x10, 0x00};
+			// Card reader UART status. Byte 2 is the pending RX count used by
+			// the game before it reads from 0x7000.
+			response[2] = static_cast<u8>(std::min<usz>(m_bngrw_response.size(), 0xff));
+			usio_log.notice("BNGRW-USIO status pending=%u", response[2]);
 			break;
 		}
 		case 0x7000:
 		{
-			// Card reader check - 2
-			// No data returned
+			const u32 read_size = std::min<u32>(size, ::size32(m_bngrw_response));
+			for (u32 i = 0; i < read_size; i++)
+			{
+				response.push_back(m_bngrw_response.front());
+				m_bngrw_response.pop_front();
+			}
+			if (read_size != 0)
+			{
+				usio_log.notice("BNGRW-USIO read: %s", fmt::buf_to_hexstring(response.data(), response.size()));
+			}
 			break;
 		}
 		case 0x1000:
@@ -590,6 +617,257 @@ void usb_device_usio::usio_init(u8 channel, u16 reg, u16 size)
 	else
 	{
 		usio_log.trace("Unsupported init operation(channel: 0x%02X, addr: 0x%04X, size: 0x%04X)", channel, reg, size);
+	}
+}
+
+void usb_device_usio::bngrw_send_ack()
+{
+	static constexpr std::array<u8, 6> ack{0x00, 0x00, 0xff, 0x00, 0xff, 0x00};
+	m_bngrw_response.insert(m_bngrw_response.end(), ack.begin(), ack.end());
+}
+
+void usb_device_usio::bngrw_send_response(u8 cmd, std::span<const u8> payload)
+{
+	std::vector<u8> frame;
+	const u8 len = static_cast<u8>(2 + payload.size());
+	frame.reserve(static_cast<usz>(len) + 7);
+	frame.insert(frame.end(), {0x00, 0x00, 0xff, len, static_cast<u8>(~len + 1), 0xd5, static_cast<u8>(cmd + 1)});
+	frame.insert(frame.end(), payload.begin(), payload.end());
+
+	u8 checksum = 0xff;
+	for (u8 i = 0; i < len; i++)
+	{
+		checksum += frame[5 + i];
+	}
+
+	frame.push_back(static_cast<u8>(~checksum));
+	frame.push_back(0x00);
+	m_bngrw_response.insert(m_bngrw_response.end(), frame.begin(), frame.end());
+	usio_log.notice("BNGRW-USIO response cmd=0x%02x data=%s", cmd, fmt::buf_to_hexstring(payload.data(), payload.size()));
+}
+
+void usb_device_usio::bngrw_send_response(u8 cmd, std::initializer_list<u8> payload)
+{
+	bngrw_send_response(cmd, std::span<const u8>(payload.begin(), payload.size()));
+}
+
+void usb_device_usio::bngrw_send_simple_response()
+{
+	bngrw_send_response(m_bngrw_request[6]);
+}
+
+void usb_device_usio::bngrw_cmd_gpio(std::span<const u8> data)
+{
+	if (data.size() >= 2)
+	{
+		if (data[0] == 0x01)
+		{
+			usio_log.notice("BNGRW-USIO LED: 0x%02x", data[1]);
+		}
+		else if (data[0] == 0x08)
+		{
+			usio_log.notice("BNGRW-USIO BEEP: 0x%02x", data[1]);
+		}
+	}
+
+	bngrw_send_simple_response();
+}
+
+void usb_device_usio::bngrw_cmd_rf_field(std::span<const u8> data)
+{
+	const bool off = data.size() >= 2 && data[0] == 0x01 && data[1] == 0x00;
+	usio_log.notice("BNGRW-USIO RF field: %s", off ? "off" : "on");
+	bngrw_send_simple_response();
+}
+
+void usb_device_usio::bngrw_cmd_poll_card()
+{
+	// aic_pico polls real NFC here. RPCS3 dev bridge reports no card until
+	// a host-side card source is wired in.
+	bngrw_send_response(m_bngrw_request[6], {0x00, 0x00, 0x00});
+}
+
+void usb_device_usio::bngrw_cmd_mifare(std::span<const u8> data)
+{
+	if (data.size() < 2)
+	{
+		bngrw_send_ack();
+		return;
+	}
+
+	switch (data[1])
+	{
+	case 0x60:
+	case 0x61:
+		bngrw_send_response(m_bngrw_request[6], {0x01});
+		break;
+	case 0x30:
+		bngrw_send_response(m_bngrw_request[6], {0x14});
+		break;
+	default:
+		usio_log.warning("BNGRW-USIO unknown MIFARE command: 0x%02x", data[1]);
+		bngrw_send_ack();
+		break;
+	}
+}
+
+void usb_device_usio::bngrw_cmd_commthru()
+{
+	bngrw_send_response(m_bngrw_request[6], {0x01});
+}
+
+void usb_device_usio::bngrw_cmd_select()
+{
+	bngrw_send_response(m_bngrw_request[6], {0x00});
+}
+
+void usb_device_usio::bngrw_cmd_deselect()
+{
+	bngrw_send_response(m_bngrw_request[6], {0x01, 0x00});
+}
+
+void usb_device_usio::bngrw_cmd_release()
+{
+	bngrw_send_response(m_bngrw_request[6], {0x01, 0x00});
+}
+
+void usb_device_usio::bngrw_cmd_felica()
+{
+	bngrw_send_response(m_bngrw_request[6], {0x01});
+}
+
+// BNGRW command handling is ported from aic_pico firmware/src/lib/bana.c
+// for local Taiko card-reader development. aic_pico's real NFC calls are
+// represented here as no-card/failure responses until a host card source
+// is connected to this bridge.
+void usb_device_usio::bngrw_handle_frame()
+{
+	if (m_bngrw_request.size() < 7)
+	{
+		return;
+	}
+
+	const u8 len = m_bngrw_request[3];
+	if (len < 2 || m_bngrw_request.size() < static_cast<usz>(len) + 7)
+	{
+		return;
+	}
+
+	const u8 dir = m_bngrw_request[5];
+	const u8 cmd = m_bngrw_request[6];
+	const u8* data = len > 2 ? &m_bngrw_request[7] : nullptr;
+	const usz data_size = len - 2;
+	const std::span<const u8> payload(data, data_size);
+
+	usio_log.notice("BNGRW-USIO request dir=0x%02x cmd=0x%02x data=%s", dir, cmd, fmt::buf_to_hexstring(data, data_size));
+
+	if (dir != 0xd4)
+	{
+		bngrw_send_ack();
+		return;
+	}
+
+	switch (cmd)
+	{
+	case 0x18:
+	case 0x12:
+		bngrw_send_simple_response();
+		break;
+	case 0x0e:
+		bngrw_cmd_gpio(payload);
+		break;
+	case 0x08:
+		bngrw_send_response(cmd, {0x00});
+		break;
+	case 0x06:
+		if (data_size > 1 && data[1] == 0x1c)
+		{
+			bngrw_send_response(cmd, {0xff, 0x3f, 0x0e, 0xf1, 0xff, 0x3f, 0x0e, 0xf1});
+		}
+		else
+		{
+			bngrw_send_response(cmd, {0xdc, 0xf4, 0x3f, 0x11, 0x4d, 0x85, 0x61, 0xf1, 0x26, 0x6a, 0x87});
+		}
+		break;
+	case 0x32:
+		bngrw_cmd_rf_field(payload);
+		break;
+	case 0x0c:
+		bngrw_send_response(cmd, {0x00, 0x06, 0x00});
+		break;
+	case 0x4a:
+		bngrw_cmd_poll_card();
+		break;
+	case 0x40:
+		bngrw_cmd_mifare(payload);
+		break;
+	case 0x42:
+		bngrw_cmd_commthru();
+		break;
+	case 0x44:
+		bngrw_cmd_deselect();
+		break;
+	case 0xa0:
+		bngrw_cmd_felica();
+		break;
+	case 0x52:
+		bngrw_cmd_release();
+		break;
+	case 0x54:
+		bngrw_cmd_select();
+		break;
+	default:
+		usio_log.warning("Unhandled BNGRW-USIO command: 0x%02x len=0x%02x data=%s", cmd, len, fmt::buf_to_hexstring(data, data_size));
+		bngrw_send_ack();
+		break;
+	}
+}
+
+void usb_device_usio::bngrw_feed_bytes(const u8* data, u32 size)
+{
+	for (u32 i = 0; i < size; i++)
+	{
+		const u8 byte = data[i];
+		if (m_bngrw_request.empty() && byte == 0x55)
+		{
+			continue;
+		}
+
+		m_bngrw_request.push_back(byte);
+
+		if (m_bngrw_request.size() == 3 && (m_bngrw_request[0] != 0x00 || m_bngrw_request[1] != 0x00 || m_bngrw_request[2] != 0xff))
+		{
+			m_bngrw_request.erase(m_bngrw_request.begin());
+			continue;
+		}
+
+		if (m_bngrw_request.size() == 6 && m_bngrw_request[3] == 0x00)
+		{
+			m_bngrw_request.clear();
+			continue;
+		}
+
+		if (m_bngrw_request.size() >= 5)
+		{
+			const u8 len = m_bngrw_request[3];
+			if (len == 0)
+			{
+				continue;
+			}
+
+			if (static_cast<u8>(len + m_bngrw_request[4]) != 0x00)
+			{
+				usio_log.warning("BNGRW-USIO bad length checksum: len=0x%02x lcs=0x%02x", len, m_bngrw_request[4]);
+				m_bngrw_request.clear();
+				continue;
+			}
+
+			if (m_bngrw_request.size() == static_cast<usz>(len) + 7)
+			{
+				bngrw_handle_frame();
+				m_bngrw_request.clear();
+			}
+		}
 	}
 }
 
@@ -684,6 +962,268 @@ void usb_device_usio::interrupt_transfer(u32 buf_size, u8* buf, u32 endpoint, Us
 	}
 	default:
 		usio_log.error("Unhandled endpoint: 0x%x", endpoint);
+		break;
+	}
+}
+
+usb_device_bngrw::usb_device_bngrw(const std::array<u8, 7>& location)
+	: usb_device_emulated(location)
+{
+	device = UsbDescriptorNode(USB_DESCRIPTOR_DEVICE,
+		UsbDeviceDescriptor{
+			.bcdUSB             = 0x0110,
+			.bDeviceClass       = 0xff,
+			.bDeviceSubClass    = 0x00,
+			.bDeviceProtocol    = 0xff,
+			.bMaxPacketSize0    = 0x40,
+			.idVendor           = 0x0b9a,
+			.idProduct          = 0x0900,
+			.bcdDevice          = 0x0900,
+			.iManufacturer      = 0x01,
+			.iProduct           = 0x02,
+			.iSerialNumber      = 0x03,
+			.bNumConfigurations = 0x01});
+
+	auto& config0 = device.add_node(UsbDescriptorNode(USB_DESCRIPTOR_CONFIG,
+		UsbDeviceConfiguration{
+			.wTotalLength        = 39,
+			.bNumInterfaces      = 0x01,
+			.bConfigurationValue = 0x01,
+			.iConfiguration      = 0x00,
+			.bmAttributes        = 0xc0,
+			.bMaxPower           = 0x32
+		}));
+
+	config0.add_node(UsbDescriptorNode(USB_DESCRIPTOR_INTERFACE,
+		UsbDeviceInterface{
+			.bInterfaceNumber   = 0x00,
+			.bAlternateSetting  = 0x00,
+			.bNumEndpoints      = 0x03,
+			.bInterfaceClass    = 0x00,
+			.bInterfaceSubClass = 0x00,
+			.bInterfaceProtocol = 0x00,
+			.iInterface         = 0x00}));
+
+	config0.add_node(UsbDescriptorNode(USB_DESCRIPTOR_ENDPOINT,
+		UsbDeviceEndpoint{
+			.bEndpointAddress = 0x01,
+			.bmAttributes     = 0x02,
+			.wMaxPacketSize   = 0x0040,
+			.bInterval        = 0x00}));
+
+	config0.add_node(UsbDescriptorNode(USB_DESCRIPTOR_ENDPOINT,
+		UsbDeviceEndpoint{
+			.bEndpointAddress = 0x82,
+			.bmAttributes     = 0x02,
+			.wMaxPacketSize   = 0x0040,
+			.bInterval        = 0x00}));
+
+	config0.add_node(UsbDescriptorNode(USB_DESCRIPTOR_ENDPOINT,
+		UsbDeviceEndpoint{
+			.bEndpointAddress = 0x83,
+			.bmAttributes     = 0x03,
+			.wMaxPacketSize   = 0x0008,
+			.bInterval        = 16}));
+
+	add_string("Namco");
+	add_string("H050 USJ(C) PCB rev00");
+	add_string("00000000");
+}
+
+void usb_device_bngrw::control_transfer(u8 bmRequestType, u8 bRequest, u16 wValue, u16 wIndex, u16 wLength, u32 buf_size, u8* buf, UsbTransfer* transfer)
+{
+	transfer->fake = true;
+	usb_device_emulated::control_transfer(bmRequestType, bRequest, wValue, wIndex, wLength, buf_size, buf, transfer);
+}
+
+void usb_device_bngrw::send_ack()
+{
+	static constexpr std::array<u8, 6> ack{0x00, 0x00, 0xff, 0x00, 0xff, 0x00};
+	m_response.insert(m_response.end(), ack.begin(), ack.end());
+}
+
+void usb_device_bngrw::send_response(u8 cmd, std::span<const u8> payload)
+{
+	std::vector<u8> frame;
+	const u8 len = static_cast<u8>(2 + payload.size());
+	frame.reserve(static_cast<usz>(len) + 7);
+	frame.insert(frame.end(), {0x00, 0x00, 0xff, len, static_cast<u8>(~len + 1), 0xd5, static_cast<u8>(cmd + 1)});
+	frame.insert(frame.end(), payload.begin(), payload.end());
+
+	u8 checksum = 0xff;
+	for (u8 i = 0; i < len; i++)
+	{
+		checksum += frame[5 + i];
+	}
+
+	frame.push_back(static_cast<u8>(~checksum));
+	frame.push_back(0x00);
+	m_response.insert(m_response.end(), frame.begin(), frame.end());
+	usio_log.notice("BNGRW response cmd=0x%02x data=%s", cmd, fmt::buf_to_hexstring(payload.data(), payload.size()));
+}
+
+void usb_device_bngrw::send_response(u8 cmd, std::initializer_list<u8> payload)
+{
+	send_response(cmd, std::span<const u8>(payload.begin(), payload.size()));
+}
+
+void usb_device_bngrw::handle_frame()
+{
+	if (m_request.size() < 7)
+	{
+		return;
+	}
+
+	const u8 len = m_request[3];
+	if (len < 2 || m_request.size() < static_cast<usz>(len) + 7)
+	{
+		return;
+	}
+
+	const u8 dir = m_request[5];
+	const u8 cmd = m_request[6];
+	const u8* data = len > 2 ? &m_request[7] : nullptr;
+	const usz data_size = len - 2;
+
+	usio_log.notice("BNGRW request dir=0x%02x cmd=0x%02x data=%s", dir, cmd, fmt::buf_to_hexstring(data, data_size));
+
+	if (dir != 0xd4)
+	{
+		send_ack();
+		return;
+	}
+
+	switch (cmd)
+	{
+	case 0x18:
+	case 0x12:
+	case 0x0e:
+		send_response(cmd);
+		break;
+	case 0x08:
+		send_response(cmd, {0x00});
+		break;
+	case 0x06:
+		if (data_size > 1 && data[1] == 0x1c)
+		{
+			send_response(cmd, {0xff, 0x3f, 0x0e, 0xf1, 0xff, 0x3f, 0x0e, 0xf1});
+		}
+		else
+		{
+			send_response(cmd, {0xdc, 0xf4, 0x3f, 0x11, 0x4d, 0x85, 0x61, 0xf1, 0x26, 0x6a, 0x87});
+		}
+		break;
+	case 0x32:
+		send_response(cmd);
+		break;
+	case 0x0c:
+		send_response(cmd, {0x00, 0x06, 0x00});
+		break;
+	case 0x4a:
+		// No card present. This matches aic_pico's Bandai Namco reader fallback
+		// and is enough for hardware tests to prove the reader is alive.
+		send_response(cmd, {0x00, 0x00, 0x00});
+		break;
+	case 0x40:
+		send_response(cmd, {0x14});
+		break;
+	case 0x42:
+		send_response(cmd, {0x01});
+		break;
+	case 0x44:
+	case 0x52:
+		send_response(cmd, {0x01, 0x00});
+		break;
+	case 0x54:
+		send_response(cmd, {0x00});
+		break;
+	case 0xa0:
+		send_response(cmd, {0x01});
+		break;
+	default:
+		usio_log.warning("Unhandled BNGRW command: 0x%02x len=0x%02x data=%s", cmd, len, fmt::buf_to_hexstring(data, data_size));
+		send_ack();
+		break;
+	}
+}
+
+void usb_device_bngrw::feed_bytes(const u8* data, u32 size)
+{
+	for (u32 i = 0; i < size; i++)
+	{
+		const u8 byte = data[i];
+		if (m_request.empty() && byte == 0x55)
+		{
+			continue;
+		}
+
+		m_request.push_back(byte);
+
+		if (m_request.size() == 3 && (m_request[0] != 0x00 || m_request[1] != 0x00 || m_request[2] != 0xff))
+		{
+			m_request.erase(m_request.begin());
+			continue;
+		}
+
+		if (m_request.size() == 6 && m_request[3] == 0x00)
+		{
+			m_request.clear();
+			continue;
+		}
+
+		if (m_request.size() >= 5)
+		{
+			const u8 len = m_request[3];
+			if (static_cast<u8>(len + m_request[4]) != 0x00)
+			{
+				usio_log.warning("BNGRW bad length checksum: len=0x%02x lcs=0x%02x", len, m_request[4]);
+				m_request.clear();
+				continue;
+			}
+
+			if (m_request.size() == static_cast<usz>(len) + 7)
+			{
+				handle_frame();
+				m_request.clear();
+			}
+		}
+	}
+}
+
+void usb_device_bngrw::interrupt_transfer(u32 buf_size, u8* buf, u32 endpoint, UsbTransfer* transfer)
+{
+	transfer->fake            = true;
+	transfer->expected_result = HC_CC_NOERR;
+	transfer->expected_time   = get_timestamp() + 1'000;
+
+	switch (endpoint)
+	{
+	case 0x01:
+		transfer->expected_count = buf_size;
+		usio_log.notice("BNGRW write: %s", fmt::buf_to_hexstring(buf, buf_size));
+		feed_bytes(buf, buf_size);
+		break;
+	case 0x82:
+	{
+		const u32 size = std::min<u32>(buf_size, ::size32(m_response));
+		for (u32 i = 0; i < size; i++)
+		{
+			buf[i] = m_response.front();
+			m_response.pop_front();
+		}
+		transfer->expected_count = size;
+		if (size != 0)
+		{
+			usio_log.notice("BNGRW read: %s", fmt::buf_to_hexstring(buf, size));
+		}
+		break;
+	}
+	case 0x83:
+		transfer->expected_count = 0;
+		break;
+	default:
+		usio_log.error("Unhandled BNGRW endpoint: 0x%x", endpoint);
+		transfer->expected_count = 0;
 		break;
 	}
 }
