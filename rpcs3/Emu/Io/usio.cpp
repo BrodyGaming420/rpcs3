@@ -965,7 +965,7 @@ void usb_device_usio::bngrw_felica_read(std::span<const u8> data)
 			const u8 d0 = descriptors[desc_pos];
 			if (d0 & 0x80)
 			{
-				block_id = descriptors[desc_pos + 1];
+				block_id = (static_cast<u16>(d0) << 8) | descriptors[desc_pos + 1];
 				desc_pos += 2;
 			}
 			else if (desc_pos + 3 <= desc_avail)
@@ -1025,7 +1025,7 @@ void usb_device_usio::bngrw_felica_write(std::span<const u8> data)
 		const u8 d0 = descriptors[desc_pos];
 		if (d0 & 0x80)
 		{
-			block_ids.push_back(descriptors[desc_pos + 1]);
+			block_ids.push_back((static_cast<u16>(d0) << 8) | descriptors[desc_pos + 1]);
 			desc_pos += 2;
 		}
 		else
