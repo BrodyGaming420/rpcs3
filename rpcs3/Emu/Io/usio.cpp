@@ -1,11 +1,6 @@
 // v406 USIO emulator
 
 #include "stdafx.h"
-#include "usio.h"
-#include "Input/pad_thread.h"
-#include "Emu/Io/usio_config.h"
-#include "Emu/IdManager.h"
-
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -17,6 +12,11 @@
 #include <unistd.h>
 #include <errno.h>
 #endif
+
+#include "usio.h"
+#include "Input/pad_thread.h"
+#include "Emu/Io/usio_config.h"
+#include "Emu/IdManager.h"
 
 LOG_CHANNEL(usio_log, "USIO");
 
